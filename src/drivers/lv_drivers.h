@@ -23,6 +23,8 @@ extern "C" {
 #include "display/drm/lv_linux_drm.h"
 #include "display/fb/lv_linux_fbdev.h"
 
+#include "sgc/lv_sgc.h"
+
 #include "display/tft_espi/lv_tft_espi.h"
 #include "display/lovyan_gfx/lv_lovyan_gfx.h"
 

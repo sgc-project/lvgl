@@ -4329,6 +4329,28 @@
     #endif
 #endif
 
+/** Driver for the simple-graphics-controller daemon (@sgc).
+ *  Takes a DRM card lease from the daemon instead of opening the card, and
+ *  renders on the lease fd; requires linking against libsgc. */
+#ifndef LV_USE_SGC
+    #ifdef CONFIG_LV_USE_SGC
+        #define LV_USE_SGC CONFIG_LV_USE_SGC
+    #else
+        #define LV_USE_SGC              0
+    #endif
+#endif
+
+#if LV_USE_SGC
+    /** How often [ms] the session is pumped for revoke/re-grant events. */
+    #ifndef LV_SGC_PUMP_PERIOD
+        #ifdef CONFIG_LV_SGC_PUMP_PERIOD
+            #define LV_SGC_PUMP_PERIOD CONFIG_LV_SGC_PUMP_PERIOD
+        #else
+            #define LV_SGC_PUMP_PERIOD  16
+        #endif
+    #endif
+#endif
+
 /** Interface for TFT_eSPI */
 #ifndef LV_USE_TFT_ESPI
     #ifdef CONFIG_LV_USE_TFT_ESPI

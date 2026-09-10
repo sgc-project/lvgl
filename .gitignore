@@ -21,3 +21,6 @@ config.h
 defconfig
 env/*
 docs-venv
+
+# consumer-provided configuration (generated, see lvgl-drm-test/gen-lv-conf.sh)
+lv_conf.h

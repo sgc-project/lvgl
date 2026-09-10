@@ -100,6 +100,7 @@ static int drm_add_conn_property(drm_dev_t * drm_dev, const char * name, uint64_
 static int find_plane(drm_dev_t * drm_dev, unsigned int fourcc, uint32_t * plane_id, uint32_t crtc_id,
                       uint32_t crtc_idx);
 static int drm_find_connector(drm_dev_t * drm_dev, int64_t connector_id);
+static void drm_get_plane_type_zpos(int fd, uint32_t plane_id, uint64_t * type, uint64_t * zpos);
 static int drm_open(const char * path);
 static int drm_setup(drm_dev_t * drm_dev, const char * device_path, int64_t connector_id, unsigned int fourcc);
 
@@ -501,6 +502,8 @@ static int find_plane(drm_dev_t * drm_dev, unsigned int fourcc, uint32_t * plane
     unsigned int i;
     unsigned int j;
     int ret = 0;
+    uint32_t best_id = 0;
+    uint64_t best_zpos = 0;
 
     planes = drmModeGetPlaneResources(drm_dev->fd);
     if(!planes) {
@@ -533,20 +536,64 @@ static int find_plane(drm_dev_t * drm_dev, unsigned int fourcc, uint32_t * plane
             continue;
         }
 
-        *plane_id = plane->plane_id;
+        uint64_t type = 0;
+        uint64_t zpos = 0;
+        drm_get_plane_type_zpos(drm_dev->fd, plane->plane_id, &type, &zpos);
+
+        /* Prefer the CRTC's primary plane: it is the one meant for full screen
+         * scanout, and taking it also replaces a framebuffer left on it by the
+         * kernel console (fbcon). */
+        if(type == DRM_PLANE_TYPE_PRIMARY) {
+            *plane_id = plane->plane_id;
+            drmModeFreePlane(plane);
+            LV_LOG_TRACE("found primary plane %d", *plane_id);
+            goto out;
+        }
+
+        /* Otherwise remember the plane composited highest (largest zpos) so the
+         * app ends up above overlays the kernel may occupy, e.g. fbcon's fb on
+         * drivers where the primary plane is not enumerable. */
+        if(best_id == 0 || zpos > best_zpos) {
+            best_id = plane->plane_id;
+            best_zpos = zpos;
+        }
+
         drmModeFreePlane(plane);
-
-        LV_LOG_TRACE("found plane %d", *plane_id);
-
-        /* Success */
-        goto out;
     }
 
-    if(i == planes->count_planes)
+    if(best_id) {
+        *plane_id = best_id;
+        LV_LOG_TRACE("found plane %d (zpos %" LV_PRIu64 ")", *plane_id, best_zpos);
+    }
+    else {
         ret = -1;
+    }
+
 out:
     drmModeFreePlaneResources(planes);
     return ret;
+}
+
+/**
+ * Read the "type" (primary/overlay/cursor) and "zpos" properties of a plane.
+ * Missing properties leave the out values at 0.
+ */
+static void drm_get_plane_type_zpos(int fd, uint32_t plane_id, uint64_t * type, uint64_t * zpos)
+{
+    drmModeObjectProperties * props = drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
+    if(!props) return;
+
+    for(uint32_t i = 0; i < props->count_props; i++) {
+        drmModePropertyPtr p = drmModeGetProperty(fd, props->props[i]);
+        if(!p) continue;
+
+        if(!strcmp(p->name, "type")) *type = props->prop_values[i];
+        else if(!strcmp(p->name, "zpos")) *zpos = props->prop_values[i];
+
+        drmModeFreeProperty(p);
+    }
+
+    drmModeFreeObjectProperties(props);
 }
 
 static int drm_find_connector(drm_dev_t * drm_dev, int64_t connector_id)

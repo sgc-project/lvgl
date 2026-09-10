@@ -106,7 +106,7 @@ static int find_plane(drm_dev_t * drm_dev, unsigned int fourcc, uint32_t * plane
 static int drm_find_connector(drm_dev_t * drm_dev, int64_t connector_id);
 static void drm_get_plane_type_zpos(int fd, uint32_t plane_id, uint64_t * type, uint64_t * zpos);
 static int drm_open(const char * path);
-static int drm_setup(drm_dev_t * drm_dev, const char * device_path, int64_t connector_id, unsigned int fourcc);
+static int drm_setup(drm_dev_t * drm_dev, int fd, int64_t connector_id, unsigned int fourcc);
 
 static uint32_t tick_get_cb(void);
 
@@ -208,11 +208,26 @@ static void drm_dmabuf_set_active_buf(lv_event_t * event)
 
 lv_result_t lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_t connector_id)
 {
+    int fd = drm_open(file);
+    if(fd < 0) return LV_RESULT_INVALID;
+
+    lv_result_t res = lv_linux_drm_set_fd(disp, fd, connector_id);
+    if(res != LV_RESULT_OK) {
+        close(fd);
+    }
+    return res;
+}
+
+lv_result_t lv_linux_drm_set_fd(lv_display_t * disp, int fd, int64_t connector_id)
+{
     int ret;
 
     drm_dev_t * drm_dev = lv_display_get_driver_data(disp);
+    if(drm_dev == NULL || fd < 0) {
+        return LV_RESULT_INVALID;
+    }
 
-    ret = drm_setup(drm_dev, file, connector_id, DRM_FOURCC);
+    ret = drm_setup(drm_dev, fd, connector_id, DRM_FOURCC);
     if(ret) {
         return LV_RESULT_INVALID;
     }
@@ -223,7 +238,7 @@ lv_result_t lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_
     ret = drm_setup_buffers(drm_dev);
     if(ret) {
         LV_LOG_ERROR("DRM buffer allocation failed");
-        close(drm_dev->fd);
+        /* The display did not take ownership of the fd. */
         drm_dev->fd = -1;
         return LV_RESULT_INVALID;
     }
@@ -801,13 +816,11 @@ err:
     return -1;
 }
 
-static int drm_setup(drm_dev_t * drm_dev, const char * device_path, int64_t connector_id, unsigned int fourcc)
+static int drm_setup(drm_dev_t * drm_dev, int fd, int64_t connector_id, unsigned int fourcc)
 {
     int ret;
 
-    drm_dev->fd = drm_open(device_path);
-    if(drm_dev->fd < 0)
-        return -1;
+    drm_dev->fd = fd;
 
     ret = drmSetClientCap(drm_dev->fd, DRM_CLIENT_CAP_ATOMIC, 1);
     if(ret) {
@@ -910,10 +923,8 @@ err:
         drmModeFreeConnector(drm_dev->conn);
         drm_dev->conn = NULL;
     }
-    if(drm_dev->fd >= 0) {
-        close(drm_dev->fd);
-        drm_dev->fd = -1;
-    }
+    /* The device fd belongs to the caller: only forget it here. */
+    drm_dev->fd = -1;
     return -1;
 }
 

@@ -1366,6 +1366,13 @@
 #if LV_USE_SGC
     /** How often [ms] the session is pumped for revoke/re-grant events. */
     #define LV_SGC_PUMP_PERIOD  16
+
+    /** Acquire the input devices the daemon advertises as well, and feed them
+     *  to LVGL through the evdev driver (requires LV_USE_EVDEV). Without this
+     *  the client holds the DRM lease only: a device it cannot consume must
+     *  stay available to other clients (the daemon's first-owner policy).
+     *  A failed input acquire is logged and skipped. */
+    #define LV_SGC_INPUT        1
 #endif
 
 /** Interface for TFT_eSPI */

@@ -4349,6 +4349,23 @@
             #define LV_SGC_PUMP_PERIOD  16
         #endif
     #endif
+
+    /** Acquire the input devices the daemon advertises as well, and feed them
+     *  to LVGL through the evdev driver (requires LV_USE_EVDEV). Without this
+     *  the client holds the DRM lease only: a device it cannot consume must
+     *  stay available to other clients (the daemon's first-owner policy).
+     *  A failed input acquire is logged and skipped. */
+    #ifndef LV_SGC_INPUT
+        #ifdef LV_KCONFIG_PRESENT
+            #ifdef CONFIG_LV_SGC_INPUT
+                #define LV_SGC_INPUT CONFIG_LV_SGC_INPUT
+            #else
+                #define LV_SGC_INPUT 0
+            #endif
+        #else
+            #define LV_SGC_INPUT        1
+        #endif
+    #endif
 #endif
 
 /** Interface for TFT_eSPI */

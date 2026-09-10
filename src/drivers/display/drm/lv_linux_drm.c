@@ -44,6 +44,10 @@
 
 #define BUFFER_CNT 2
 
+/** Bound for waiting on a page flip event. A device that is gone - a revoked
+ *  DRM lease, a removed card - never delivers the event. */
+#define DRM_FLIP_TIMEOUT_MS 1000
+
 /**********************
  *      TYPEDEFS
  **********************/
@@ -506,6 +510,7 @@ static int drm_dmabuf_set_plane(drm_dev_t * drm_dev, drm_buffer_t * buf)
     if(ret) {
         LV_LOG_ERROR("drmModeAtomicCommit failed: %s (%d)", strerror(errno), errno);
         drmModeAtomicFree(drm_dev->req);
+        drm_dev->req = NULL;
         return ret;
     }
 
@@ -1124,14 +1129,20 @@ static void drm_flush_wait(lv_display_t * disp)
     while(drm_dev->req) {
         int ret;
         do {
-            ret = poll(&pfd, 1, -1);
+            ret = poll(&pfd, 1, DRM_FLIP_TIMEOUT_MS);
         } while(ret == -1 && errno == EINTR);
 
-        if(ret > 0)
+        if(ret > 0) {
             drmHandleEvent(drm_dev->fd, &drm_dev->drm_event_ctx);
+        }
         else {
-            LV_LOG_ERROR("poll failed: %s", strerror(errno));
-            return;
+            if(ret == 0) LV_LOG_ERROR("no page flip event within %d ms", DRM_FLIP_TIMEOUT_MS);
+            else LV_LOG_ERROR("poll failed: %s", strerror(errno));
+
+            /* Drop the pending request so the refresh loop is not stuck on a
+             * flip that will never complete. */
+            drmModeAtomicFree(drm_dev->req);
+            drm_dev->req = NULL;
         }
     }
 }

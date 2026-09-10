@@ -54,6 +54,10 @@ typedef struct {
     unsigned long int size;
     uint8_t * map;
     uint32_t fb_handle;
+#if LV_USE_LINUX_DRM_GBM_BUFFERS
+    struct gbm_bo * gbm_bo;   /* buffer object the mapping belongs to */
+    void * gbm_map_data;      /* opaque handle required by gbm_bo_unmap() */
+#endif
 } drm_buffer_t;
 
 typedef struct {
@@ -1025,12 +1029,22 @@ static int create_gbm_buffer(drm_dev_t * drm_dev, drm_buffer_t * buf)
 
     }
 
-    buf->map = mmap(NULL, buf->size, PROT_READ | PROT_WRITE, MAP_SHARED, prime_fd, 0);
+    /* A dma-buf fd is not required to be mappable by its exporter, so map the
+     * buffer through GBM instead of mmap()ing the prime fd directly. */
+    uint32_t map_stride = 0;
+    void * map_data = NULL;
+    void * map = gbm_bo_map(gbm_bo, 0, 0, drm_dev->width, drm_dev->height,
+                            GBM_BO_TRANSFER_WRITE, &map_stride, &map_data);
 
-    if(buf->map == MAP_FAILED) {
-        LV_LOG_ERROR("Failed to mmap dma-buf fd.");
+    if(map == NULL) {
+        LV_LOG_ERROR("Failed to map gbm buffer object: %s", strerror(errno));
+        gbm_bo_destroy(gbm_bo);
         return -1;
     }
+
+    buf->map = map;
+    buf->gbm_bo = gbm_bo;
+    buf->gbm_map_data = map_data;
 
     /* Used to perform DMA_BUF_SYNC ioctl calls during the rendering cycle */
     buf->handle = prime_fd;
@@ -1164,8 +1178,11 @@ static void drm_del_event_cb(lv_event_t * e)
             b->fb_handle = 0;
         }
 
-        if(MAP_FAILED != b->map) {
-            munmap(b->map, b->size);
+        if(b->gbm_bo) {
+            gbm_bo_unmap(b->gbm_bo, b->gbm_map_data);
+            gbm_bo_destroy(b->gbm_bo);
+            b->gbm_bo = NULL;
+            b->gbm_map_data = NULL;
             b->map = MAP_FAILED;
         }
 

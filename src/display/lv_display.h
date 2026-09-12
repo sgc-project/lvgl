@@ -617,6 +617,21 @@ lv_timer_t * lv_display_get_refr_timer(lv_display_t * disp);
 void lv_display_delete_refr_timer(lv_display_t * disp);
 
 /**
+ * Create the refresh timer of a display, unless it already has one.
+ *
+ * The counterpart of `lv_display_delete_refr_timer()`: a driver that parks a
+ * display - releases the device behind it but keeps the display and its screens
+ * alive - can delete the refresh timer so that nothing draws while parked, and
+ * create it again once the device is back.
+ *
+ * The new timer is made ready immediately, so the display is refreshed on the
+ * next `lv_timer_handler()` call.
+ *
+ * @param disp  pointer to a display, or NULL to use the default display
+ */
+void lv_display_create_refr_timer(lv_display_t * disp);
+
+/**
  * Register vsync event of a display. `LV_EVENT_VSYNC` event will be sent periodically.
  * Please don't use it in display event listeners, as it may cause memory leaks and illegal access issues.
  *

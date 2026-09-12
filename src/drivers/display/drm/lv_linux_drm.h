@@ -88,6 +88,18 @@ lv_result_t lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_
 lv_result_t lv_linux_drm_set_fd(lv_display_t * disp, int fd, int64_t connector_id);
 
 /**
+ * @brief Detach the display from its DRM device
+ *
+ * Releases the device fd, the buffers and every DRM object the display holds,
+ * and stops its refreshing. The display object and its screens - the
+ * application's UI - stay alive: attach it again with lv_linux_drm_set_fd() to
+ * render on another device, for example on a fresh DRM lease fd after a revoke.
+ *
+ * @param disp pointer to the display object created with lv_linux_drm_create()
+ */
+void lv_linux_drm_detach(lv_display_t * disp);
+
+/**
  * @brief Automatically find a suitable DRM device path
  *
  * Scans the system for available DRM devices and returns the path to a suitable

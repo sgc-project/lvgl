@@ -24,6 +24,7 @@
 
 #include "../../../stdlib/lv_sprintf.h"
 #include "../../../draw/lv_draw_buf.h"
+#include "../../../core/lv_obj.h"
 
 #if LV_USE_LINUX_DRM_GBM_BUFFERS
     #include <gbm.h>
@@ -74,6 +75,7 @@ typedef struct {
     uint32_t blob_id;
     drmModeCrtc * saved_crtc;
     drmModeAtomicReq * req;
+    bool needs_modeset; /**< The next atomic commit has to set a mode (first commit after attaching) */
     drmEventContext drm_event_ctx;
     drmModePlane * plane;
     drmModeCrtc * crtc;
@@ -268,6 +270,20 @@ lv_result_t lv_linux_drm_set_fd(lv_display_t * disp, int fd, int64_t connector_i
     if(width) {
         lv_display_set_dpi(disp, DIV_ROUND_UP(hor_res * 25400, width * 1000));
     }
+
+    /* The display is attached again: it gets its flush path and its refresh
+     * back, and every buffer has to be drawn again. */
+    lv_display_set_flush_cb(disp, drm_flush);
+    lv_display_set_flush_wait_cb(disp, drm_flush_wait);
+    lv_display_flush_ready(disp);
+    lv_display_enable_invalidation(disp, true);
+    lv_display_create_refr_timer(disp); /* no-op unless the display was parked */
+
+    lv_timer_t * refr = lv_display_get_refr_timer(disp);
+    if(refr) lv_timer_resume(refr);
+
+    lv_obj_t * scr = lv_display_get_screen_active(disp);
+    if(scr) lv_obj_invalidate(scr);
 
     LV_LOG_INFO("Resolution is set to %" LV_PRId32 "x%" LV_PRId32 " at %" LV_PRId32 "dpi",
                 hor_res, ver_res, lv_display_get_dpi(disp));
@@ -467,7 +483,6 @@ static int drm_add_conn_property(drm_dev_t * drm_dev, const char * name, uint64_
 static int drm_dmabuf_set_plane(drm_dev_t * drm_dev, drm_buffer_t * buf)
 {
     int ret;
-    static int first = 1;
     uint32_t flags = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
 
 #if LV_USE_LINUX_DRM_GBM_BUFFERS
@@ -483,8 +498,8 @@ static int drm_dmabuf_set_plane(drm_dev_t * drm_dev, drm_buffer_t * buf)
 
     drm_dev->req = drmModeAtomicAlloc();
 
-    /* On first Atomic commit, do a modeset */
-    if(first) {
+    /* On the first Atomic commit after attaching, do a modeset */
+    if(drm_dev->needs_modeset) {
         drm_add_conn_property(drm_dev, "CRTC_ID", drm_dev->crtc_id);
 
         drm_add_crtc_property(drm_dev, "MODE_ID", drm_dev->blob_id);
@@ -492,7 +507,7 @@ static int drm_dmabuf_set_plane(drm_dev_t * drm_dev, drm_buffer_t * buf)
 
         flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
 
-        first = 0;
+        drm_dev->needs_modeset = false;
     }
 
     drm_add_plane_property(drm_dev, "FB_ID", buf->fb_handle);
@@ -826,6 +841,7 @@ static int drm_setup(drm_dev_t * drm_dev, int fd, int64_t connector_id, unsigned
     int ret;
 
     drm_dev->fd = fd;
+    drm_dev->needs_modeset = true;
 
     ret = drmSetClientCap(drm_dev->fd, DRM_CLIENT_CAP_ATOMIC, 1);
     if(ret) {
@@ -1166,14 +1182,35 @@ static void drm_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_
 
 }
 
-static void drm_del_event_cb(lv_event_t * e)
+/**
+ * Release everything the display holds on the device - buffers, framebuffers,
+ * DRM objects and the device fd - and park it. The display object and every
+ * screen (the application's UI) stay alive, so the very same display can be
+ * attached to a device again with lv_linux_drm_set_fd().
+ */
+static void drm_detach_device(drm_dev_t * drm_dev, lv_display_t * disp)
 {
-    if(LV_EVENT_DELETE != lv_event_get_code(e))
-        return;
+    /* A flush may still be in flight - its page flip will never complete now.
+     * Abandon it, otherwise the next refresh spins in LVGL's wait_for_flushing()
+     * (with flush_wait_cb cleared it busy-waits on disp->flushing). */
+    lv_display_flush_ready(disp);
 
-    lv_display_t * disp = lv_event_get_current_target(e);
-    drm_dev_t * drm_dev = lv_display_get_driver_data(disp);
-    if(!drm_dev) return;
+    /* The application keeps running while parked. Its invalidations must not
+     * queue draws into buffers that are about to be released, and must not wake
+     * the refresh timer up again. */
+    lv_display_enable_invalidation(disp, false);
+
+    /* Nothing may be drawn into the buffers that are about to go away, so take
+     * them away from LVGL: a stray refresh bails out instead of writing into
+     * freed memory. lv_linux_drm_set_fd() installs fresh ones. */
+    lv_display_set_draw_buffers(disp, NULL, NULL);
+
+    /* Park it for real: with the refresh timer gone nothing can draw into the
+     * buffers that are about to be released - and an invalidation cannot wake
+     * the refresh up again through LV_EVENT_REFR_REQUEST. */
+    lv_display_delete_refr_timer(disp);
+    lv_display_set_flush_cb(disp, NULL);
+    lv_display_set_flush_wait_cb(disp, NULL);
 
     /* Restore original CRTC if saved */
     if(drm_dev->fd >= 0 && drm_dev->saved_crtc) {
@@ -1184,8 +1221,7 @@ static void drm_del_event_cb(lv_event_t * e)
         drm_dev->saved_crtc = NULL;
     }
 
-    /* Prevent further flushes & free any pending atomic request */
-    lv_display_set_flush_cb(disp, NULL);
+    /* Drop any pending atomic request */
     if(drm_dev->req) {
         drmModeAtomicFree(drm_dev->req);
         drm_dev->req = NULL;
@@ -1290,8 +1326,42 @@ static void drm_del_event_cb(lv_event_t * e)
         drm_dev->fd = -1;
     }
 
+    /* The next attach sets a mode again. */
+    drm_dev->needs_modeset = true;
+}
+
+static void drm_del_event_cb(lv_event_t * e)
+{
+    if(LV_EVENT_DELETE != lv_event_get_code(e))
+        return;
+
+    lv_display_t * disp = lv_event_get_current_target(e);
+    drm_dev_t * drm_dev = lv_display_get_driver_data(disp);
+    if(!drm_dev) return;
+
+    drm_detach_device(drm_dev, disp);
+
     lv_display_set_driver_data(disp, NULL);
     lv_free(drm_dev);
+}
+
+/**
+ * @brief Detach the display from its DRM device
+ *
+ * Releases the device fd, the buffers and every DRM object the display holds,
+ * and stops its refreshing: the display object and its screens stay alive.
+ * Attach it again with lv_linux_drm_set_fd() to render on another device - for
+ * example on a fresh DRM lease fd after a revoke.
+ *
+ * @param disp pointer to the display object created with lv_linux_drm_create()
+ */
+void lv_linux_drm_detach(lv_display_t * disp)
+{
+    drm_dev_t * drm_dev = lv_display_get_driver_data(disp);
+    if(drm_dev == NULL) return;
+
+    lv_display_remove_event_cb_with_user_data(disp, drm_dmabuf_set_active_buf, drm_dev);
+    drm_detach_device(drm_dev, disp);
 }
 
 static uint32_t tick_get_cb(void)

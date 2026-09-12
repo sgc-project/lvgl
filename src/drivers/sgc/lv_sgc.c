@@ -4,9 +4,20 @@
  *
  * The controller owns the graphics devices; this driver takes a DRM card lease
  * (and, with LV_SGC_INPUT, the input devices) from it instead of opening the
- * devices itself, and drives the LVGL DRM display on the lease fd. The whole
- * driver only exists when LV_USE_SGC is enabled in lv_conf.h - with it off this
- * file compiles to nothing and the direct DRM/GBM drivers are untouched.
+ * devices itself, and owns the whole session lifecycle: connecting, acquiring,
+ * the revocable lease and reconnecting when the daemon goes away. The
+ * application only ever gets a display - the lease, the park/resume cycle and
+ * recovery all happen here.
+ *
+ * The display (and every screen on it) is created once and lives for as long as
+ * the session does: a revoke parks it - refreshing stops, the device is
+ * released, the application's UI stays alive - and a re-grant attaches it to
+ * the fresh lease. Reconnecting after the daemon disappeared works the same
+ * way, so an application never has to deal with any of this.
+ *
+ * The whole driver exists only when LV_USE_SGC is enabled in lv_conf.h: with
+ * the option off this file compiles to nothing and the direct DRM/GBM drivers
+ * are untouched.
  */
 
 #include "lv_sgc.h"
@@ -15,6 +26,7 @@
 
 #include <string.h>
 #include <unistd.h>
+
 
 #include "libsgc.h"
 #include "../../stdlib/lv_sprintf.h"
@@ -33,6 +45,8 @@
 
 #define SGC_ERR_LEN 256
 #define SGC_MAX_INPUTS 8
+/** Retry period [ms] for connecting to the daemon and acquiring the lease. */
+#define SGC_RETRY_PERIOD 1000
 
 /**********************
  *      TYPEDEFS
@@ -45,14 +59,15 @@ typedef struct {
 } lv_sgc_input_t;
 
 typedef struct {
-    sgc_client * client;         /**< Session handle; NULL before connect and after release */
+    sgc_client * client;         /**< Session handle; NULL while disconnected */
     sgc_resource drm;            /**< The DRM card resource this display renders on */
-    lv_display_t * disp;         /**< Display on the lease; NULL while suspended */
-    lv_timer_t * pump;           /**< Pumps the session for revoke/re-grant events */
-    lv_sgc_state_cb_t state_cb;  /**< Application callback for state changes */
+    lv_display_t * disp;         /**< The display; created once, parked across revokes */
+    lv_timer_t * pump;           /**< Pumps the session, and retries connecting */
+    lv_sgc_state_cb_t state_cb;  /**< Optional application notification */
     void * state_cb_data;
     lv_sgc_state_t state;
     lv_sgc_input_t inputs[SGC_MAX_INPUTS]; /**< Input devices held from the daemon */
+    uint32_t retry_at;           /**< Tick of the next connect attempt while disconnected */
 } lv_sgc_ctx_t;
 
 /**********************
@@ -63,9 +78,10 @@ static void pump_cb(lv_timer_t * t);
 static void disp_delete_cb(lv_event_t * e);
 static const char * kind_name(int kind);
 static void set_state(lv_sgc_state_t state);
-static lv_display_t * build_display(int lease_fd);
-static void suspend_display(void);
-static void end_session(const char * reason);
+static lv_result_t attach_display(int lease_fd);
+static void park_display(void);
+static void release_controller(void);
+static bool connect_and_acquire(void);
 #if LV_SGC_INPUT
     static bool is_input_kind(int kind);
     static void input_attach(sgc_resource r, int fd);
@@ -91,19 +107,13 @@ static bool deleting_display;
 
 lv_display_t * lv_sgc_create(void)
 {
-    char err[SGC_ERR_LEN] = {0};
-    sgc_resource * advertised = NULL;
-    size_t advertised_count = 0;
-    bool have_drm = false;
-
-    /* Reset the session fields but keep the state callback the application may
-     * have registered with lv_sgc_set_state_cb() before creating the display. */
     ctx.client = NULL;
     ctx.disp = NULL;
     ctx.pump = NULL;
-    ctx.state = LV_SGC_STATE_LOST;
+    ctx.state = LV_SGC_STATE_SUSPENDED;
     ctx.drm.kind = 0;
     ctx.drm.index = 0;
+    ctx.retry_at = 0;
 
     for(int i = 0; i < SGC_MAX_INPUTS; i++) {
         ctx.inputs[i].resource.kind = -1;
@@ -111,69 +121,16 @@ lv_display_t * lv_sgc_create(void)
         ctx.inputs[i].indev = NULL;
     }
 
-    ctx.client = sgc_connect(err, sizeof(err));
-    if(ctx.client == NULL) {
-        LV_LOG_ERROR("sgc: cannot reach the @sgc daemon: %s", err);
+    /* Bring the session up once, synchronously: an application that gets a
+     * display back expects it to be showing. The pump timer keeps it alive and
+     * recovers it from then on. */
+    if(!connect_and_acquire()) {
+        release_controller();
         return NULL;
     }
-    LV_LOG_INFO("sgc: connected to @sgc");
-
-    if(sgc_advertised(ctx.client, &advertised, &advertised_count) != 0) {
-        LV_LOG_ERROR("sgc: the daemon did not list its resources");
-        goto fail;
-    }
-
-    for(size_t i = 0; i < advertised_count; i++) {
-        LV_LOG_INFO("sgc: advertised %s{%d}", kind_name(advertised[i].kind), advertised[i].index);
-        if(!have_drm && advertised[i].kind == SGC_RESOURCE_DRM) {
-            /* Like the other clients: render on the first advertised card. */
-            ctx.drm = advertised[i];
-            have_drm = true;
-        }
-    }
-
-    if(!have_drm) {
-        LV_LOG_ERROR("sgc: the daemon advertises no DRM card to render on");
-        goto fail;
-    }
-
-    LV_LOG_INFO("sgc: acquiring %s{%d}...", kind_name(ctx.drm.kind), ctx.drm.index);
-    if(sgc_acquire(ctx.client, ctx.drm, err, sizeof(err)) != 0) {
-        LV_LOG_ERROR("sgc: %s{%d} was not granted: %s", kind_name(ctx.drm.kind), ctx.drm.index, err);
-        goto fail;
-    }
-    LV_LOG_INFO("sgc: %s{%d} lease granted", kind_name(ctx.drm.kind), ctx.drm.index);
-
-    int lease_fd = sgc_fd(ctx.client, ctx.drm, err, sizeof(err));
-    if(lease_fd < 0) {
-        LV_LOG_ERROR("sgc: cannot borrow the lease fd: %s", err);
-        goto fail;
-    }
-
-    if(build_display(lease_fd) == NULL) {
-        close(lease_fd);
-        goto fail;
-    }
-
-#if LV_SGC_INPUT
-    /* Best effort, after the display so the input devices can be attached to it. */
-    inputs_acquire(advertised, advertised_count);
-#endif
-
-    sgc_free(advertised);
-    advertised = NULL;
 
     ctx.pump = lv_timer_create(pump_cb, LV_SGC_PUMP_PERIOD, NULL);
-    set_state(LV_SGC_STATE_ACTIVE);
     return ctx.disp;
-
-fail:
-    if(advertised) sgc_free(advertised);
-    if(ctx.client) {
-        sgc_release(ctx.client);
-        ctx.client = NULL;
-    }
-    return NULL;
 }
 
 void lv_sgc_set_state_cb(lv_sgc_state_cb_t cb, void * user_data)
@@ -192,83 +149,152 @@ lv_sgc_state_t lv_sgc_get_state(void)
  **********************/
 
 /**
- * Build a display on a lease fd. Takes ownership of the fd on success; on
- * failure the caller still owns it.
+ * Connect to the daemon, acquire the advertised DRM card and attach the display
+ * to the lease; then take the advertised input devices (best effort). Returns
+ * false when there is nothing to render on (no daemon, no card, denied).
  */
-static lv_display_t * build_display(int lease_fd)
+static bool connect_and_acquire(void)
 {
-    lv_display_t * disp = lv_linux_drm_create();
-    if(disp == NULL) {
-        LV_LOG_ERROR("sgc: cannot create the DRM display");
-        return NULL;
+    char err[SGC_ERR_LEN] = {0};
+    sgc_resource * advertised = NULL;
+    size_t advertised_count = 0;
+    bool have_drm = false;
+    int lease_fd;
+
+    ctx.client = sgc_connect(err, sizeof(err));
+    if(ctx.client == NULL) {
+        LV_LOG_WARN("sgc: @sgc is not reachable: %s", err);
+        return false;
     }
 
-    if(lv_linux_drm_set_fd(disp, lease_fd, -1) != LV_RESULT_OK) {
-        LV_LOG_ERROR("sgc: cannot modeset on the lease");
-        deleting_display = true;
-        lv_display_delete(disp);
-        deleting_display = false;
-        return NULL;
+    if(sgc_advertised(ctx.client, &advertised, &advertised_count) != 0) {
+        LV_LOG_WARN("sgc: the daemon did not list its resources");
+        goto fail;
     }
 
-    lv_display_add_event_cb(disp, disp_delete_cb, LV_EVENT_DELETE, NULL);
-    ctx.disp = disp;
+    for(size_t i = 0; i < advertised_count; i++) {
+        if(!have_drm && advertised[i].kind == SGC_RESOURCE_DRM) {
+            /* Like the other clients: render on the first advertised card. */
+            ctx.drm = advertised[i];
+            have_drm = true;
+        }
+    }
+    if(!have_drm) {
+        LV_LOG_WARN("sgc: the daemon advertises no DRM card to render on");
+        goto fail;
+    }
+
+    LV_LOG_INFO("sgc: connected to @sgc, acquiring %s{%d}", kind_name(ctx.drm.kind), ctx.drm.index);
+    if(sgc_acquire(ctx.client, ctx.drm, err, sizeof(err)) != 0) {
+        LV_LOG_WARN("sgc: %s{%d} was not granted: %s", kind_name(ctx.drm.kind), ctx.drm.index, err);
+        goto fail;
+    }
+    LV_LOG_INFO("sgc: %s{%d} lease granted", kind_name(ctx.drm.kind), ctx.drm.index);
+
+    lease_fd = sgc_fd(ctx.client, ctx.drm, err, sizeof(err));
+    if(lease_fd < 0) {
+        LV_LOG_WARN("sgc: cannot borrow the lease fd: %s", err);
+        goto fail;
+    }
+
+    if(attach_display(lease_fd) != LV_RESULT_OK) {
+        close(lease_fd); /* not taken over on failure */
+        goto fail;
+    }
 
 #if LV_SGC_INPUT
-    /* A new display means the input devices have to be attached to it again. */
-    inputs_attach_to_display(disp);
+    inputs_acquire(advertised, advertised_count);
 #endif
 
-    LV_LOG_INFO("sgc: display %" LV_PRId32 "x%" LV_PRId32 " is up on the lease",
-                lv_display_get_horizontal_resolution(disp), lv_display_get_vertical_resolution(disp));
-    return disp;
+    sgc_free(advertised);
+    set_state(LV_SGC_STATE_ACTIVE);
+    return true;
+
+fail:
+    if(advertised) sgc_free(advertised);
+    return false;
 }
 
-/** The controller took the card back: the lease (and the display with it) is
- *  gone. The session stays connected - the daemon re-grants the card to this
- *  queued session once it is free again. */
-static void suspend_display(void)
+/**
+ * Attach the display to a lease fd, creating the display on the first call.
+ * Takes ownership of the fd on success; on failure the caller keeps it.
+ */
+static lv_result_t attach_display(int lease_fd)
 {
-    if(ctx.disp) {
-        deleting_display = true;
-        lv_display_delete(ctx.disp);
-        deleting_display = false;
-        ctx.disp = NULL;
+    bool created = false;
+
+    if(ctx.disp == NULL) {
+        ctx.disp = lv_linux_drm_create();
+        if(ctx.disp == NULL) {
+            LV_LOG_ERROR("sgc: cannot create the DRM display");
+            return LV_RESULT_INVALID;
+        }
+        created = true;
     }
-    set_state(LV_SGC_STATE_SUSPENDED);
+
+    if(lv_linux_drm_set_fd(ctx.disp, lease_fd, -1) != LV_RESULT_OK) {
+        LV_LOG_ERROR("sgc: cannot modeset on the lease");
+        if(created) {
+            deleting_display = true;
+            lv_display_delete(ctx.disp);
+            deleting_display = false;
+            ctx.disp = NULL;
+        }
+        return LV_RESULT_INVALID;
+    }
+
+    if(created) {
+        /* The display outlives revokes, so it is only deleted with the session. */
+        lv_display_add_event_cb(ctx.disp, disp_delete_cb, LV_EVENT_DELETE, NULL);
+    }
+
+#if LV_SGC_INPUT
+    inputs_attach_to_display(ctx.disp);
+#endif
+
+    LV_LOG_INFO("sgc: display %" LV_PRId32 "x%" LV_PRId32 " running on the lease",
+                lv_display_get_horizontal_resolution(ctx.disp), lv_display_get_vertical_resolution(ctx.disp));
+    return LV_RESULT_OK;
 }
 
-/** The connection is gone: nothing can be rendered anymore. */
-static void end_session(const char * reason)
+/** Park the display: give the device back, stop drawing, keep the UI alive. */
+static void park_display(void)
 {
-    if(reason) LV_LOG_ERROR("sgc: %s", reason);
-
-    if(ctx.pump) {
-        lv_timer_delete(ctx.pump);
-        ctx.pump = NULL;
-    }
-
     if(ctx.disp) {
-        deleting_display = true;
-        lv_display_delete(ctx.disp);
-        deleting_display = false;
-        ctx.disp = NULL;
+        lv_linux_drm_detach(ctx.disp);
     }
+}
 
+/** Drop everything that belongs to the controller connection. */
+static void release_controller(void)
+{
 #if LV_SGC_INPUT
     inputs_release_all();
 #endif
-
     if(ctx.client) {
         sgc_release(ctx.client);
         ctx.client = NULL;
     }
-
-    set_state(LV_SGC_STATE_LOST);
 }
+
 static void pump_cb(lv_timer_t * t)
 {
     LV_UNUSED(t);
+
+    if(ctx.client == NULL) {
+        /* Disconnected: the daemon may be back (or may have restarted). */
+        if(lv_tick_elaps(ctx.retry_at) < SGC_RETRY_PERIOD) return;
+        ctx.retry_at = lv_tick_get();
+
+        LV_LOG_INFO("sgc: trying to reconnect to @sgc");
+        if(connect_and_acquire()) {
+            LV_LOG_INFO("sgc: session recovered");
+        }
+        else {
+            release_controller();
+        }
+        return;
+    }
 
     sgc_event ev;
     char err[SGC_ERR_LEN] = {0};
@@ -279,7 +305,12 @@ static void pump_cb(lv_timer_t * t)
     if(ret == 0) return;
 
     if(ret < 0) {
-        end_session(err);
+        /* The daemon is gone; the lease died with it. Park and retry. */
+        LV_LOG_WARN("sgc: session with @sgc is over: %s", err);
+        park_display();
+        release_controller();
+        ctx.retry_at = lv_tick_get();
+        set_state(LV_SGC_STATE_SUSPENDED);
         return;
     }
 
@@ -308,14 +339,17 @@ static void pump_cb(lv_timer_t * t)
     }
 
     if(ev.kind == SGC_EVENT_REVOKED) {
-        suspend_display();
+        /* The controller lent the card to someone else. The application keeps
+         * its UI; we wait for the re-grant and attach the display again. */
+        park_display();
+        set_state(LV_SGC_STATE_SUSPENDED);
     }
     else if(ev.kind == SGC_EVENT_GRANTED) {
         if(ev.fd < 0) {
             LV_LOG_ERROR("sgc: re-grant without a lease fd");
             return;
         }
-        if(build_display(ev.fd) == NULL) {
+        if(attach_display(ev.fd) != LV_RESULT_OK) {
             close(ev.fd);
             return;
         }
@@ -336,21 +370,28 @@ static void disp_delete_cb(lv_event_t * e)
         ctx.pump = NULL;
     }
 
-#if LV_SGC_INPUT
-    inputs_release_all();
-#endif
-
-    if(ctx.client) {
-        sgc_release(ctx.client);
-        ctx.client = NULL;
-    }
-    ctx.state = LV_SGC_STATE_LOST; /* no callback: the application is tearing down */
+    release_controller();
+    ctx.state = LV_SGC_STATE_SUSPENDED; /* no callback: the application is tearing down */
 }
 
 static void set_state(lv_sgc_state_t state)
 {
+    if(ctx.state == state) return;
+
     ctx.state = state;
     if(ctx.state_cb) ctx.state_cb(state, ctx.state_cb_data);
+}
+
+static const char * kind_name(int kind)
+{
+    switch(kind) {
+        case SGC_RESOURCE_FBDEV:    return "Fbdev";
+        case SGC_RESOURCE_DRM:      return "Drm";
+        case SGC_RESOURCE_MOUSE:    return "Mouse";
+        case SGC_RESOURCE_KEYBOARD: return "Keyboard";
+        case SGC_RESOURCE_TOUCH:    return "Touch";
+        default:                    return "?";
+    }
 }
 
 #if LV_SGC_INPUT
@@ -474,17 +515,5 @@ static void inputs_attach_to_display(lv_display_t * disp)
     }
 }
 #endif /*LV_SGC_INPUT*/
-
-static const char * kind_name(int kind)
-{
-    switch(kind) {
-        case SGC_RESOURCE_FBDEV:    return "Fbdev";
-        case SGC_RESOURCE_DRM:      return "Drm";
-        case SGC_RESOURCE_MOUSE:    return "Mouse";
-        case SGC_RESOURCE_KEYBOARD: return "Keyboard";
-        case SGC_RESOURCE_TOUCH:    return "Touch";
-        default:                    return "?";
-    }
-}
 
 #endif /*LV_USE_SGC*/

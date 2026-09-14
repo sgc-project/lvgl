@@ -15,6 +15,12 @@
  * the fresh lease. Reconnecting after the daemon disappeared works the same
  * way, so an application never has to deal with any of this.
  *
+ * Input devices (LV_SGC_INPUT) ride with the seat: the daemon revokes them when
+ * this client leaves the display, so a re-grant asks for them again, and a
+ * device that merely went away is suspended - the daemon re-grants that one on
+ * its own, and the LVGL input device reading the dead fd is replaced when it
+ * does.
+ *
  * The whole driver exists only when LV_USE_SGC is enabled in lv_conf.h: with
  * the option off this file compiles to nothing and the direct DRM/GBM drivers
  * are untouched.
@@ -67,6 +73,10 @@ typedef struct {
     void * state_cb_data;
     lv_sgc_state_t state;
     lv_sgc_input_t inputs[SGC_MAX_INPUTS]; /**< Input devices held from the daemon */
+    sgc_resource wanted[SGC_MAX_INPUTS]; /**< Input devices this app wants: the ones the
+                                          *   daemon advertised. What a seat handover
+                                          *   re-acquires (see inputs_reacquire) */
+    size_t wanted_count;         /**< Entries in `wanted` */
     uint32_t retry_at;           /**< Tick of the next connect attempt while disconnected */
 } lv_sgc_ctx_t;
 
@@ -87,6 +97,8 @@ static bool connect_and_acquire(void);
     static void input_attach(sgc_resource r, int fd);
     static void input_release(sgc_resource r);
     static void inputs_acquire(sgc_resource * advertised, size_t count);
+    static void inputs_remember(sgc_resource * advertised, size_t count);
+    static void inputs_reacquire(void);
     static void inputs_release_all(void);
     static void inputs_attach_to_display(lv_display_t * disp);
 #endif
@@ -114,6 +126,7 @@ lv_display_t * lv_sgc_create(void)
     ctx.drm.kind = 0;
     ctx.drm.index = 0;
     ctx.retry_at = 0;
+    ctx.wanted_count = 0;
 
     for(int i = 0; i < SGC_MAX_INPUTS; i++) {
         ctx.inputs[i].resource.kind = -1;
@@ -203,7 +216,10 @@ static bool connect_and_acquire(void)
     }
 
 #if LV_SGC_INPUT
-    inputs_acquire(advertised, advertised_count);
+    /* Remember what the daemon offers before the list is freed: a seat handover
+     * has to ask for these again (inputs_reacquire). */
+    inputs_remember(advertised, advertised_count);
+    inputs_acquire(ctx.wanted, ctx.wanted_count);
 #endif
 
     sgc_free(advertised);
@@ -354,6 +370,14 @@ static void pump_cb(lv_timer_t * t)
             return;
         }
         set_state(LV_SGC_STATE_ACTIVE);
+
+#if LV_SGC_INPUT
+        /* Back on screen: the lease was revoked with the input devices that
+         * went with it (the daemon revokes a seat's devices when it leaves the
+         * seat and never re-grants them with the display), so ask again -
+         * otherwise the app is visible with no pointer and no keyboard. */
+        inputs_reacquire();
+#endif
     }
 }
 
@@ -441,6 +465,17 @@ static void input_attach(sgc_resource r, int fd)
         return;
     }
 
+    /* A grant for a device this app already holds is the device coming BACK:
+     * it was suspended rather than revoked (no revoke arrives, and the daemon
+     * re-grants the same resource with a fresh fd). The LVGL device that is
+     * still there reads the fd that died with the old one, so it goes. */
+    if(slot->indev) {
+        LV_LOG_INFO("sgc: %s{%d} came back - replacing the input device that lost its device",
+                    kind_name(r.kind), r.index);
+        lv_evdev_delete(slot->indev);
+        slot->indev = NULL;
+    }
+
     lv_indev_t * indev = lv_evdev_create_fd(indev_type_of(r.kind), fd);
     if(indev == NULL) {
         LV_LOG_WARN("sgc: cannot create an input device for %s{%d}", kind_name(r.kind), r.index);
@@ -480,6 +515,10 @@ static void inputs_acquire(sgc_resource * advertised, size_t count)
 
     for(size_t i = 0; i < count; i++) {
         if(!is_input_kind(advertised[i].kind)) continue;
+        /* Already ours: a device that went away is suspended, not revoked, so
+         * the daemon brings it back on its own - asking again would only earn a
+         * "not available while its device is away". */
+        if(input_find(advertised[i]) != NULL) continue;
 
         lv_memzero(err, sizeof(err));
         if(sgc_acquire(ctx.client, advertised[i], err, sizeof(err)) != 0) {
@@ -497,6 +536,33 @@ static void inputs_acquire(sgc_resource * advertised, size_t count)
         }
         input_attach(advertised[i], fd);
     }
+}
+
+/**
+ * Remember the input devices the daemon advertises: what this app wants. A seat
+ * handover makes the daemon revoke them with the display, and the list is the
+ * only record of what to ask for again.
+ */
+static void inputs_remember(sgc_resource * advertised, size_t count)
+{
+    ctx.wanted_count = 0;
+    for(size_t i = 0; i < count && ctx.wanted_count < SGC_MAX_INPUTS; i++) {
+        if(is_input_kind(advertised[i].kind)) {
+            ctx.wanted[ctx.wanted_count++] = advertised[i];
+        }
+    }
+}
+
+/**
+ * Ask for the wanted devices again after the display came back. Best effort
+ * like every input acquire, and a no-op when there is nothing to ask for.
+ */
+static void inputs_reacquire(void)
+{
+    if(ctx.wanted_count == 0) return;
+
+    LV_LOG_INFO("sgc: back on screen - re-acquiring the input devices");
+    inputs_acquire(ctx.wanted, ctx.wanted_count);
 }
 
 static void inputs_release_all(void)

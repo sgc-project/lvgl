@@ -1258,6 +1258,17 @@ void lv_display_delete_refr_timer(lv_display_t * disp)
     disp->refr_timer = NULL;
 }
 
+void lv_display_create_refr_timer(lv_display_t * disp)
+{
+    if(disp == NULL) disp = lv_display_get_default();
+    if(disp == NULL || disp->refr_timer) return;
+
+    disp->refr_timer = lv_timer_create(lv_display_refr_timer, LV_DEF_REFR_PERIOD, disp);
+    LV_ASSERT_MALLOC(disp->refr_timer);
+    /* Refresh immediately: the display surely has something to draw. */
+    if(disp->refr_timer) lv_timer_ready(disp->refr_timer);
+}
+
 lv_result_t lv_display_send_vsync_event(lv_display_t * disp, void * param)
 {
     if(disp == NULL) {

@@ -1,0 +1,28 @@
+config LV_USE_SGC
+	bool "simple-graphics-controller (@sgc)"
+	select LV_USE_LINUX_DRM
+	default n
+	help
+	  Driver for the simple-graphics-controller daemon (@sgc): takes a DRM card
+	  lease from the daemon instead of opening the card itself, and renders on
+	  the lease fd. Requires linking against libsgc.
+
+if LV_USE_SGC
+
+config LV_SGC_PUMP_PERIOD
+	int "Session pump period [ms]"
+	default 16
+	help
+	  How often [ms] the session is pumped for revoke/re-grant events.
+
+config LV_SGC_INPUT
+	bool "Acquire the input devices the daemon advertises"
+	default y
+	help
+	  Acquire the input devices the daemon advertises as well, and feed them to
+	  LVGL through the evdev driver (requires LV_USE_EVDEV). Without this the
+	  client holds the DRM lease only: a device it cannot consume must stay
+	  available to other clients (the daemon's first-owner policy). A failed
+	  input acquire is logged and skipped.
+
+endif # LV_USE_SGC

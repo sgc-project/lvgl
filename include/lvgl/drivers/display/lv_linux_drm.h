@@ -72,6 +72,38 @@ lv_display_t * lv_linux_drm_create(void);
 lv_result_t lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_t connector_id);
 
 /**
+ * @brief Configure the display from an already open DRM device fd
+ *
+ * Same as lv_linux_drm_set_file() but for a device fd that is already open,
+ * e.g. a DRM lease fd obtained from another process. The fd must be a DRM
+ * device fd the caller may modeset on; it is not probed for the dumb buffer
+ * capability and no master is claimed, so a lease held by a lessor keeps
+ * working.
+ *
+ * On success the display takes ownership of the fd and closes it when the
+ * display is detached or deleted. On failure the caller keeps ownership of the
+ * fd.
+ *
+ * @param disp         Pointer to the display object created with lv_linux_drm_create()
+ * @param fd           Open DRM device fd (or DRM lease fd)
+ * @param connector_id ID of the DRM connector to use, or -1 to auto-select the first available
+ * @return LV_RESULT_OK if the initialization succeeeded or LV_RESULT_INVALID if it failed
+ */
+lv_result_t lv_linux_drm_set_fd(lv_display_t * disp, int fd, int64_t connector_id);
+
+/**
+ * @brief Detach the display from its DRM device
+ *
+ * Releases the device fd, the buffers and every DRM object the display holds,
+ * and stops its refreshing. The display object and its screens - the
+ * application's UI - stay alive: attach it again with lv_linux_drm_set_fd() to
+ * render on another device, for example on a fresh DRM lease fd after a revoke.
+ *
+ * @param disp pointer to the display object created with lv_linux_drm_create()
+ */
+void lv_linux_drm_detach(lv_display_t * disp);
+
+/**
  * @brief Automatically find a suitable DRM device path
  *
  * Scans the system for available DRM devices and returns the path to a suitable

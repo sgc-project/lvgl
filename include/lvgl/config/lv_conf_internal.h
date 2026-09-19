@@ -3681,6 +3681,34 @@
     #endif
 #endif
 
+#ifndef LV_USE_SGC
+    #ifdef CONFIG_LV_USE_SGC
+        #define LV_USE_SGC CONFIG_LV_USE_SGC
+    #else
+        #define LV_USE_SGC 0
+    #endif
+#endif
+
+#ifndef LV_SGC_PUMP_PERIOD
+    #ifdef CONFIG_LV_SGC_PUMP_PERIOD
+        #define LV_SGC_PUMP_PERIOD CONFIG_LV_SGC_PUMP_PERIOD
+    #else
+        #define LV_SGC_PUMP_PERIOD 16
+    #endif
+#endif
+
+#ifndef LV_SGC_INPUT
+    #ifdef LV_KCONFIG_PRESENT
+        #ifdef CONFIG_LV_SGC_INPUT
+            #define LV_SGC_INPUT CONFIG_LV_SGC_INPUT
+        #else
+            #define LV_SGC_INPUT 0
+        #endif
+    #else
+          #define LV_SGC_INPUT LV_USE_SGC
+    #endif
+#endif
+
 #ifndef LV_USE_UEFI
     #ifdef CONFIG_LV_USE_UEFI
         #define LV_USE_UEFI CONFIG_LV_USE_UEFI
@@ -5490,6 +5518,10 @@ LV_EXPORT_CONST_INT(LV_DRAW_BUF_ALIGN);
 
 #if (LV_USE_FILE_EXPLORER) && !LV_USE_TABLE
     #error "LV_USE_TABLE must be enabled: Kconfig selects it from LV_USE_FILE_EXPLORER"
+#endif
+
+#if (LV_USE_SGC) && !LV_USE_LINUX_DRM
+    #error "LV_USE_LINUX_DRM must be enabled: Kconfig selects it from LV_USE_SGC"
 #endif
 
 #if LV_LINUX_FBDEV_BSD && !(LV_USE_LINUX_FBDEV)

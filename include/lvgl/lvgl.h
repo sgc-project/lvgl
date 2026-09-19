@@ -71,6 +71,7 @@
 #include "draw/lv_snapshot.h"
 #include "draw/lv_draw_utils.h"
 #include "drivers/display/lv_linux_drm.h"
+#include "drivers/display/lv_sgc.h"
 #include "drivers/display/lv_draw_eve_display.h"
 #include "drivers/display/lv_draw_eve_display_defines.h"
 #include "drivers/display/lv_draw_eve_target.h"

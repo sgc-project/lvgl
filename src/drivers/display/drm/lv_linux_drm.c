@@ -41,6 +41,10 @@
 
 #define BUFFER_CNT 2
 
+/** Bound for waiting on a page flip event. A device that is gone - a revoked
+ *  DRM lease, a removed card - never delivers the event. */
+#define DRM_FLIP_TIMEOUT_MS 1000
+
 /**********************
  *      TYPEDEFS
  **********************/
@@ -51,6 +55,10 @@ typedef struct {
     unsigned long int size;
     uint8_t * map;
     uint32_t fb_handle;
+#if LV_USE_LINUX_DRM_GBM_BUFFERS
+    struct gbm_bo * gbm_bo;   /* buffer object the mapping belongs to */
+    void * gbm_map_data;      /* opaque handle required by gbm_bo_unmap() */
+#endif
 } drm_buffer_t;
 
 typedef struct {
@@ -63,6 +71,7 @@ typedef struct {
     uint32_t blob_id;
     drmModeCrtc * saved_crtc;
     drmModeAtomicReq * req;
+    bool needs_modeset; /**< The next atomic commit has to set a mode (first commit after attaching) */
     drmEventContext drm_event_ctx;
     drmModePlane * plane;
     drmModeCrtc * crtc;
@@ -97,8 +106,9 @@ static int drm_add_conn_property(drm_dev_t * drm_dev, const char * name, uint64_
 static int find_plane(drm_dev_t * drm_dev, unsigned int fourcc, uint32_t * plane_id, uint32_t crtc_id,
                       uint32_t crtc_idx);
 static int drm_find_connector(drm_dev_t * drm_dev, int64_t connector_id);
+static void drm_get_plane_type_zpos(int fd, uint32_t plane_id, uint64_t * type, uint64_t * zpos);
 static int drm_open(const char * path);
-static int drm_setup(drm_dev_t * drm_dev, const char * device_path, int64_t connector_id, unsigned int fourcc);
+static int drm_setup(drm_dev_t * drm_dev, int fd, int64_t connector_id, unsigned int fourcc);
 
 static uint32_t tick_get_cb(void);
 
@@ -200,13 +210,30 @@ static void drm_dmabuf_set_active_buf(lv_event_t * event)
 
 lv_result_t lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_t connector_id)
 {
+    LV_CHECK_ARG(file != NULL, return LV_RESULT_INVALID);
+
+    int fd = drm_open(file);
+    if(fd < 0) return LV_RESULT_INVALID;
+
+    lv_result_t res = lv_linux_drm_set_fd(disp, fd, connector_id);
+    if(res != LV_RESULT_OK) {
+        close(fd);
+    }
+    return res;
+}
+
+lv_result_t lv_linux_drm_set_fd(lv_display_t * disp, int fd, int64_t connector_id)
+{
     int ret;
 
     LV_CHECK_ARG(disp != NULL, return LV_RESULT_INVALID);
-    LV_CHECK_ARG(file != NULL, return LV_RESULT_INVALID);
+    LV_CHECK_ARG(fd >= 0, return LV_RESULT_INVALID);
     drm_dev_t * drm_dev = lv_display_get_driver_data(disp);
+    if(drm_dev == NULL) {
+        return LV_RESULT_INVALID;
+    }
 
-    ret = drm_setup(drm_dev, file, connector_id, DRM_FOURCC);
+    ret = drm_setup(drm_dev, fd, connector_id, DRM_FOURCC);
     if(ret) {
         return LV_RESULT_INVALID;
     }
@@ -217,7 +244,7 @@ lv_result_t lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_
     ret = drm_setup_buffers(drm_dev);
     if(ret) {
         LV_LOG_ERROR("DRM buffer allocation failed");
-        close(drm_dev->fd);
+        /* The display did not take ownership of the fd. */
         drm_dev->fd = -1;
         return LV_RESULT_INVALID;
     }
@@ -243,6 +270,20 @@ lv_result_t lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_
     if(width) {
         lv_display_set_dpi(disp, DIV_ROUND_UP(hor_res * 25400, width * 1000));
     }
+
+    /* The display is attached again: it gets its flush path and its refresh
+     * back, and every buffer has to be drawn again. */
+    lv_display_set_flush_cb(disp, drm_flush);
+    lv_display_set_flush_wait_cb(disp, drm_flush_wait);
+    lv_display_flush_ready(disp);
+    lv_display_enable_invalidation(disp, true);
+    lv_display_create_refr_timer(disp); /* no-op unless the display was parked */
+
+    lv_timer_t * refr = lv_display_get_refr_timer(disp);
+    if(refr) lv_timer_resume(refr);
+
+    lv_obj_t * scr = lv_display_get_screen_active(disp);
+    if(scr) lv_obj_invalidate(scr);
 
     LV_LOG_INFO("Resolution is set to %" LV_PRId32 "x%" LV_PRId32 " at %" LV_PRId32 "dpi",
                 hor_res, ver_res, lv_display_get_dpi(disp));
@@ -442,7 +483,6 @@ static int drm_add_conn_property(drm_dev_t * drm_dev, const char * name, uint64_
 static int drm_dmabuf_set_plane(drm_dev_t * drm_dev, drm_buffer_t * buf)
 {
     int ret;
-    static int first = 1;
     uint32_t flags = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
 
 #if LV_USE_LINUX_DRM_GBM_BUFFERS
@@ -458,8 +498,8 @@ static int drm_dmabuf_set_plane(drm_dev_t * drm_dev, drm_buffer_t * buf)
 
     drm_dev->req = drmModeAtomicAlloc();
 
-    /* On first Atomic commit, do a modeset */
-    if(first) {
+    /* On the first Atomic commit after attaching, do a modeset */
+    if(drm_dev->needs_modeset) {
         drm_add_conn_property(drm_dev, "CRTC_ID", drm_dev->crtc_id);
 
         drm_add_crtc_property(drm_dev, "MODE_ID", drm_dev->blob_id);
@@ -467,7 +507,7 @@ static int drm_dmabuf_set_plane(drm_dev_t * drm_dev, drm_buffer_t * buf)
 
         flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
 
-        first = 0;
+        drm_dev->needs_modeset = false;
     }
 
     drm_add_plane_property(drm_dev, "FB_ID", buf->fb_handle);
@@ -485,6 +525,7 @@ static int drm_dmabuf_set_plane(drm_dev_t * drm_dev, drm_buffer_t * buf)
     if(ret) {
         LV_LOG_ERROR("drmModeAtomicCommit failed: %s (%d)", strerror(errno), errno);
         drmModeAtomicFree(drm_dev->req);
+        drm_dev->req = NULL;
         return ret;
     }
 
@@ -500,6 +541,8 @@ static int find_plane(drm_dev_t * drm_dev, unsigned int fourcc, uint32_t * plane
     unsigned int i;
     unsigned int j;
     int ret = 0;
+    uint32_t best_id = 0;
+    uint64_t best_zpos = 0;
 
     planes = drmModeGetPlaneResources(drm_dev->fd);
     if(!planes) {
@@ -532,20 +575,64 @@ static int find_plane(drm_dev_t * drm_dev, unsigned int fourcc, uint32_t * plane
             continue;
         }
 
-        *plane_id = plane->plane_id;
+        uint64_t type = 0;
+        uint64_t zpos = 0;
+        drm_get_plane_type_zpos(drm_dev->fd, plane->plane_id, &type, &zpos);
+
+        /* Prefer the CRTC's primary plane: it is the one meant for full screen
+         * scanout, and taking it also replaces a framebuffer left on it by the
+         * kernel console (fbcon). */
+        if(type == DRM_PLANE_TYPE_PRIMARY) {
+            *plane_id = plane->plane_id;
+            drmModeFreePlane(plane);
+            LV_LOG_TRACE("found primary plane %d", *plane_id);
+            goto out;
+        }
+
+        /* Otherwise remember the plane composited highest (largest zpos) so the
+         * app ends up above overlays the kernel may occupy, e.g. fbcon's fb on
+         * drivers where the primary plane is not enumerable. */
+        if(best_id == 0 || zpos > best_zpos) {
+            best_id = plane->plane_id;
+            best_zpos = zpos;
+        }
+
         drmModeFreePlane(plane);
-
-        LV_LOG_TRACE("found plane %d", *plane_id);
-
-        /* Success */
-        goto out;
     }
 
-    if(i == planes->count_planes)
+    if(best_id) {
+        *plane_id = best_id;
+        LV_LOG_TRACE("found plane %d (zpos %" LV_PRIu64 ")", *plane_id, best_zpos);
+    }
+    else {
         ret = -1;
+    }
+
 out:
     drmModeFreePlaneResources(planes);
     return ret;
+}
+
+/**
+ * Read the "type" (primary/overlay/cursor) and "zpos" properties of a plane.
+ * Missing properties leave the out values at 0.
+ */
+static void drm_get_plane_type_zpos(int fd, uint32_t plane_id, uint64_t * type, uint64_t * zpos)
+{
+    drmModeObjectProperties * props = drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
+    if(!props) return;
+
+    for(uint32_t i = 0; i < props->count_props; i++) {
+        drmModePropertyPtr p = drmModeGetProperty(fd, props->props[i]);
+        if(!p) continue;
+
+        if(!strcmp(p->name, "type")) *type = props->prop_values[i];
+        else if(!strcmp(p->name, "zpos")) *zpos = props->prop_values[i];
+
+        drmModeFreeProperty(p);
+    }
+
+    drmModeFreeObjectProperties(props);
 }
 
 static int drm_find_connector(drm_dev_t * drm_dev, int64_t connector_id)
@@ -749,13 +836,12 @@ err:
     return -1;
 }
 
-static int drm_setup(drm_dev_t * drm_dev, const char * device_path, int64_t connector_id, unsigned int fourcc)
+static int drm_setup(drm_dev_t * drm_dev, int fd, int64_t connector_id, unsigned int fourcc)
 {
     int ret;
 
-    drm_dev->fd = drm_open(device_path);
-    if(drm_dev->fd < 0)
-        return -1;
+    drm_dev->fd = fd;
+    drm_dev->needs_modeset = true;
 
     ret = drmSetClientCap(drm_dev->fd, DRM_CLIENT_CAP_ATOMIC, 1);
     if(ret) {
@@ -858,10 +944,8 @@ err:
         drmModeFreeConnector(drm_dev->conn);
         drm_dev->conn = NULL;
     }
-    if(drm_dev->fd >= 0) {
-        close(drm_dev->fd);
-        drm_dev->fd = -1;
-    }
+    /* The device fd belongs to the caller: only forget it here. */
+    drm_dev->fd = -1;
     return -1;
 }
 
@@ -977,12 +1061,22 @@ static int create_gbm_buffer(drm_dev_t * drm_dev, drm_buffer_t * buf)
 
     }
 
-    buf->map = mmap(NULL, buf->size, PROT_READ | PROT_WRITE, MAP_SHARED, prime_fd, 0);
+    /* A dma-buf fd is not required to be mappable by its exporter, so map the
+     * buffer through GBM instead of mmap()ing the prime fd directly. */
+    uint32_t map_stride = 0;
+    void * map_data = NULL;
+    void * map = gbm_bo_map(gbm_bo, 0, 0, drm_dev->width, drm_dev->height,
+                            GBM_BO_TRANSFER_WRITE, &map_stride, &map_data);
 
-    if(buf->map == MAP_FAILED) {
-        LV_LOG_ERROR("Failed to mmap dma-buf fd.");
+    if(map == NULL) {
+        LV_LOG_ERROR("Failed to map gbm buffer object: %s", strerror(errno));
+        gbm_bo_destroy(gbm_bo);
         return -1;
     }
+
+    buf->map = map;
+    buf->gbm_bo = gbm_bo;
+    buf->gbm_map_data = map_data;
 
     /* Used to perform DMA_BUF_SYNC ioctl calls during the rendering cycle */
     buf->handle = prime_fd;
@@ -1051,14 +1145,20 @@ static void drm_flush_wait(lv_display_t * disp)
     while(drm_dev->req) {
         int ret;
         do {
-            ret = poll(&pfd, 1, -1);
+            ret = poll(&pfd, 1, DRM_FLIP_TIMEOUT_MS);
         } while(ret == -1 && errno == EINTR);
 
-        if(ret > 0)
+        if(ret > 0) {
             drmHandleEvent(drm_dev->fd, &drm_dev->drm_event_ctx);
+        }
         else {
-            LV_LOG_ERROR("poll failed: %s", strerror(errno));
-            return;
+            if(ret == 0) LV_LOG_ERROR("no page flip event within %d ms", DRM_FLIP_TIMEOUT_MS);
+            else LV_LOG_ERROR("poll failed: %s", strerror(errno));
+
+            /* Drop the pending request so the refresh loop is not stuck on a
+             * flip that will never complete. */
+            drmModeAtomicFree(drm_dev->req);
+            drm_dev->req = NULL;
         }
     }
 }
@@ -1082,14 +1182,35 @@ static void drm_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_
 
 }
 
-static void drm_del_event_cb(lv_event_t * e)
+/**
+ * Release everything the display holds on the device - buffers, framebuffers,
+ * DRM objects and the device fd - and park it. The display object and every
+ * screen (the application's UI) stay alive, so the very same display can be
+ * attached to a device again with lv_linux_drm_set_fd().
+ */
+static void drm_detach_device(drm_dev_t * drm_dev, lv_display_t * disp)
 {
-    if(LV_EVENT_DELETE != lv_event_get_code(e))
-        return;
+    /* A flush may still be in flight - its page flip will never complete now.
+     * Abandon it, otherwise the next refresh spins in LVGL's wait_for_flushing()
+     * (with flush_wait_cb cleared it busy-waits on disp->flushing). */
+    lv_display_flush_ready(disp);
 
-    lv_display_t * disp = lv_event_get_current_target(e);
-    drm_dev_t * drm_dev = lv_display_get_driver_data(disp);
-    if(!drm_dev) return;
+    /* The application keeps running while parked. Its invalidations must not
+     * queue draws into buffers that are about to be released, and must not wake
+     * the refresh timer up again. */
+    lv_display_enable_invalidation(disp, false);
+
+    /* Nothing may be drawn into the buffers that are about to go away, so take
+     * them away from LVGL: a stray refresh bails out instead of writing into
+     * freed memory. lv_linux_drm_set_fd() installs fresh ones. */
+    lv_display_set_draw_buffers(disp, NULL, NULL);
+
+    /* Park it for real: with the refresh timer gone nothing can draw into the
+     * buffers that are about to be released - and an invalidation cannot wake
+     * the refresh up again through LV_EVENT_REFR_REQUEST. */
+    lv_display_delete_refr_timer(disp);
+    lv_display_set_flush_cb(disp, NULL);
+    lv_display_set_flush_wait_cb(disp, NULL);
 
     /* Restore original CRTC if saved */
     if(drm_dev->fd >= 0 && drm_dev->saved_crtc) {
@@ -1100,8 +1221,7 @@ static void drm_del_event_cb(lv_event_t * e)
         drm_dev->saved_crtc = NULL;
     }
 
-    /* Prevent further flushes & free any pending atomic request */
-    lv_display_set_flush_cb(disp, NULL);
+    /* Drop any pending atomic request */
     if(drm_dev->req) {
         drmModeAtomicFree(drm_dev->req);
         drm_dev->req = NULL;
@@ -1116,8 +1236,11 @@ static void drm_del_event_cb(lv_event_t * e)
             b->fb_handle = 0;
         }
 
-        if(MAP_FAILED != b->map) {
-            munmap(b->map, b->size);
+        if(b->gbm_bo) {
+            gbm_bo_unmap(b->gbm_bo, b->gbm_map_data);
+            gbm_bo_destroy(b->gbm_bo);
+            b->gbm_bo = NULL;
+            b->gbm_map_data = NULL;
             b->map = MAP_FAILED;
         }
 
@@ -1203,8 +1326,42 @@ static void drm_del_event_cb(lv_event_t * e)
         drm_dev->fd = -1;
     }
 
+    /* The next attach sets a mode again. */
+    drm_dev->needs_modeset = true;
+}
+
+static void drm_del_event_cb(lv_event_t * e)
+{
+    if(LV_EVENT_DELETE != lv_event_get_code(e))
+        return;
+
+    lv_display_t * disp = lv_event_get_current_target(e);
+    drm_dev_t * drm_dev = lv_display_get_driver_data(disp);
+    if(!drm_dev) return;
+
+    drm_detach_device(drm_dev, disp);
+
     lv_display_set_driver_data(disp, NULL);
     lv_free(drm_dev);
+}
+
+/**
+ * @brief Detach the display from its DRM device
+ *
+ * Releases the device fd, the buffers and every DRM object the display holds,
+ * and stops its refreshing: the display object and its screens stay alive.
+ * Attach it again with lv_linux_drm_set_fd() to render on another device - for
+ * example on a fresh DRM lease fd after a revoke.
+ *
+ * @param disp pointer to the display object created with lv_linux_drm_create()
+ */
+void lv_linux_drm_detach(lv_display_t * disp)
+{
+    drm_dev_t * drm_dev = lv_display_get_driver_data(disp);
+    if(drm_dev == NULL) return;
+
+    lv_display_remove_event_cb_with_user_data(disp, drm_dmabuf_set_active_buf, drm_dev);
+    drm_detach_device(drm_dev, disp);
 }
 
 static uint32_t tick_get_cb(void)

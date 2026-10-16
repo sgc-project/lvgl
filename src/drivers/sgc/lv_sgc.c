@@ -193,7 +193,14 @@ static bool connect_and_acquire(void)
 
     for(size_t i = 0; i < advertised_count; i++) {
         if(!have_drm && advertised[i].kind == SGC_RESOURCE_DRM) {
-            /* Like the other clients: render on the first advertised card. */
+            /* Like the other clients: render on the first advertised card.
+             *
+             * SGC_RESOURCE_DRM is a card's primary plane — the plane an app on
+             * the display scans out through. Overlay planes ride a different
+             * role in the @sgc protocol and this server does not grant one yet,
+             * so there is nothing here to ignore: the driver below renders on
+             * the primary plane the lease carries, and LVGL's DRM driver
+             * prefers that plane itself (find_plane() in lv_linux_drm.c). */
             ctx.drm = advertised[i];
             have_drm = true;
         }
